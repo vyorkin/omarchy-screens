@@ -1,6 +1,22 @@
 const assert = require("assert")
 const Model = require("../Model.js")
 
+const shared = [
+  { name: "DP-1", identity: "DP-1", enabled: true },
+  { name: "DP-2", identity: "DP-2", enabled: true },
+]
+assert.strictEqual(Model.indexByIdentity(shared, "DP-2"), 1)
+assert.strictEqual(Model.indexByIdentity(shared, "DP-2", "DP-2"), 1)
+// A saved selection can name the panel by the description both answer to.
+const twins = [
+  { name: "DP-1", identity: "desc:Xiaomi Corporation Mi Monitor", enabled: true },
+  { name: "DP-2", identity: "desc:Xiaomi Corporation Mi Monitor", enabled: true },
+]
+assert.strictEqual(Model.indexByIdentity(twins, "desc:Xiaomi Corporation Mi Monitor"), 0)
+assert.strictEqual(Model.indexByIdentity(twins, "desc:Xiaomi Corporation Mi Monitor", "DP-2"), 1)
+assert.strictEqual(Model.indexByIdentity(shared, "desc:Gone", "DP-2"), 1)
+assert.strictEqual(Model.indexByIdentity(shared, "desc:Gone", "DP-9"), -1)
+
 assert.deepStrictEqual(Model.splitCounts(2), [5, 5])
 assert.deepStrictEqual(Model.splitCounts(3), [4, 3, 3])
 assert.deepStrictEqual(Model.splitCounts(9), [2, 1, 1, 1, 1, 1, 1, 1, 1])

@@ -66,10 +66,18 @@ function indexByName(monitors, name) {
   return -1
 }
 
-function indexByIdentity(monitors, identity) {
-  for (var i = 0; i < monitors.length; i++) {
-    if (monitors[i].identity === identity) return i
+function indexByIdentity(monitors, identity, name) {
+  var i
+  var first = -1
+  for (i = 0; i < monitors.length; i++) {
+    if (monitors[i].identity !== identity) continue
+    // Several panels can share one description, so the identity alone may name
+    // all of them. The connector is what tells them apart.
+    if (name && monitors[i].name === name) return i
+    if (first < 0) first = i
   }
+  if (first >= 0) return first
+  if (name) return indexByName(monitors, name)
   return -1
 }
 
@@ -786,6 +794,7 @@ function monitorTopologyKey(monitors) {
 if (typeof module !== "undefined") {
   module.exports = {
     clone: clone,
+    indexByIdentity: indexByIdentity,
     snapMove: snapMove,
     normalizeOrigin: normalizeOrigin,
     applyPayload: applyPayload,

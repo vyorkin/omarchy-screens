@@ -432,7 +432,7 @@ Panel {
         root.detectNote = "No other displays found"
       }
     } else if (keepId || keepName) {
-      var kept = keepId ? Model.indexByIdentity(list, keepId) : -1
+      var kept = keepId ? Model.indexByIdentity(list, keepId, keepName) : -1
       if (kept < 0 && keepName) kept = Model.indexByName(list, keepName)
       if (kept >= 0) root.selectedIndex = kept
       else if (root.selectedIndex >= list.length) root.selectedIndex = Math.max(0, list.length - 1)

@@ -449,7 +449,7 @@ def restore_disabled_geometry(monitors, hints):
     for mon in monitors:
         if not mon.get("enabled"):
             continue
-        rule = hints.get(mon.get("identity") or "")
+        rule = saved_entry_for(hints, mon)
         if rule and "x" in rule:
             dx = int(mon.get("x") or 0) - int(rule.get("x") or 0)
             dy = int(mon.get("y") or 0) - int(rule.get("y") or 0)
@@ -457,7 +457,7 @@ def restore_disabled_geometry(monitors, hints):
     for entry in monitors:
         if entry.get("enabled"):
             continue
-        rule = hints.get(entry.get("identity") or "")
+        rule = saved_entry_for(hints, entry)
         if not rule:
             continue
         if "x" in rule:
@@ -571,6 +571,7 @@ def merge_drm_connected(monitors):
 def snapshot():
     raw = hypr_json(["monitors", "all"]) or []
     monitors = []
+    ambiguous = ambiguous_descriptions(raw)
     saw_placeholder = False
     for mon in raw:
         name = mon.get("name") or ""
@@ -667,13 +668,13 @@ def snapshot():
             "physicalH": int(mon.get("physicalHeight") or 0),
             "mirror": mirror,
         }
-        entry["identity"] = monitor_identity(entry)
+        entry["identity"] = monitor_identity(entry, ambiguous)
         monitors.append(entry)
     lua_rules = parse_lua_monitors(read_monitors_lua())
     store_early = load_store()
     layout_by_id = layout_map(store_early.get("lastLayout"))
     for entry in monitors:
-        saved = layout_by_id.get(entry.get("identity") or "") or {}
+        saved = saved_entry_for(layout_by_id, entry, ambiguous) or {}
         for key in (
             "bitdepth", "cm", "hdrMode", "sdrMinLuminance", "sdrMaxLuminance",
             "sdrBrightness", "sdrSaturation", "sdrEotf", "supportsWideColor",
@@ -706,7 +707,8 @@ def snapshot():
     ensure_original_backup()
     store = load_store()
     ids = [m["identity"] for m in monitors if m.get("identity")]
-    match = match_profile(store, ids)
+    stored_ids = [key for m in monitors for key in identity_keys(m, ambiguous)]
+    match = match_profile(store, ids, stored_ids)
     restore_disabled_geometry(monitors, layout_hints(store, match))
     park_disabled(monitors)
     monitors.sort(key=lambda m: (not m["enabled"], m["x"], m["y"], m["name"]))
@@ -725,8 +727,16 @@ def snapshot():
             primary = focused["identity"]
             store["primary"] = primary
             save_store(store)
-    if primary and not any(m.get("identity") == primary for m in monitors):
-        primary = ""
+    # A saved primary may name a shared panel by its old description id. Move
+    # it to the id that output answers to now instead of dropping the choice.
+    if primary:
+        owner = next((m for m in monitors if primary in identity_keys(m, ambiguous)), None)
+        if not owner:
+            primary = ""
+        elif owner.get("identity") != primary:
+            primary = owner.get("identity") or ""
+            store["primary"] = primary
+            save_store(store)
     return {
         "monitors": monitors,
         "profiles": [
@@ -767,13 +777,77 @@ def clean_desc(text):
     return re.sub(r"\s+\([^)]+\)$", "", desc)
 
 
-def monitor_identity(mon):
+def bare_desc(mon):
+    """The description as Hyprland reports it, without the desc: prefix."""
     desc = clean_desc(mon.get("description") or mon.get("id") or "")
     if desc.startswith("desc:"):
-        return desc
-    if desc:
+        desc = desc[5:].strip()
+    return desc
+
+
+def ambiguous_descriptions(monitors):
+    """Descriptions more than one output answers to.
+
+    Hyprland matches a desc: selector on a prefix (Monitor.cpp), so two panels
+    that report the same description take the same rule and nothing here can
+    tell them apart. Panels of one model with an empty EDID serial land here.
+    """
+    seen = {}
+    for mon in monitors or []:
+        if not isinstance(mon, dict):
+            continue
+        desc = bare_desc(mon)
+        if desc:
+            seen[desc] = seen.get(desc, 0) + 1
+    return {desc for desc, count in seen.items() if count > 1}
+
+
+def monitor_identity(mon, ambiguous=None):
+    """desc:<description>, or the connector name when that description is shared.
+
+    The description follows the panel across ports, which is what a saved
+    layout wants. It stops being an identity once several outputs answer to
+    it, and then the connector is the only unique name there is.
+    """
+    desc = bare_desc(mon)
+    if desc and not (ambiguous and desc in ambiguous):
         return "desc:%s" % desc
-    return mon.get("name") or ""
+    name = clean_connector(mon.get("name"))
+    if name:
+        return name
+    return "desc:%s" % desc if desc else str(mon.get("name") or "").strip()
+
+
+def identity_keys(mon, ambiguous=None):
+    """Stored ids this output may be found under, most specific first.
+
+    Older versions wrote the description for a shared panel, so a layout saved
+    before that output got its connector id still has to be found by it.
+    """
+    if not isinstance(mon, dict):
+        return [str(mon or "")] if mon else []
+    desc = bare_desc(mon)
+    keys = []
+    for key in (
+        mon.get("identity"),
+        monitor_identity(mon, ambiguous),
+        "desc:%s" % desc if desc else "",
+        clean_connector(mon.get("name")),
+    ):
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def saved_entry_for(mapping, mon, ambiguous=None):
+    """First entry of an id-keyed map that belongs to this output."""
+    if not mapping:
+        return None
+    for key in identity_keys(mon, ambiguous):
+        entry = mapping.get(key)
+        if entry:
+            return entry
+    return None
 
 
 def connected_key(monitors):
@@ -994,7 +1068,7 @@ def restore_desk_geometry(monitors):
     if not hints:
         return monitors
     for mon in monitors:
-        rule = hints.get(mon.get("identity") or "")
+        rule = saved_entry_for(hints, mon)
         if not rule:
             continue
         apply_saved_layout_fields(mon, rule)
@@ -1129,10 +1203,16 @@ def find_profile(store, name):
     return None
 
 
-def match_profile(store, identities):
+def match_profile(store, identities, aliases=None):
+    """Name of a saved profile that covers these outputs.
+
+    aliases carries the ids older versions stored for the same outputs, so a
+    profile saved before an output got its connector id still matches it.
+    """
     ids = set(identities)
     if not ids:
         return ""
+    known = ids | {a for a in (aliases or ()) if a}
     exact = ""
     best = ""
     best_score = 0
@@ -1142,7 +1222,7 @@ def match_profile(store, identities):
             continue
         if pids == ids:
             exact = profile.get("name") or ""
-        elif pids <= ids and len(pids) > best_score:
+        elif pids <= known and len(pids) > best_score:
             best = profile.get("name") or ""
             best_score = len(pids)
     return exact or best
@@ -1152,6 +1232,15 @@ def profile_rule(profile, identity):
     for mon in profile.get("monitors") or []:
         if mon.get("id") == identity:
             return mon
+    return None
+
+
+def profile_rule_for(profile, mon, ambiguous=None):
+    """Profile entry for an output, accepting the ids older versions stored."""
+    for key in identity_keys(mon, ambiguous):
+        rule = profile_rule(profile, key)
+        if rule:
+            return rule
     return None
 
 
@@ -1511,8 +1600,9 @@ def recover_internal(quiet=False):
             needs_write = lua_has_dummy_output(existing)
             if not needs_write:
                 have = set(parse_lua_monitors(existing))
+                ambiguous = ambiguous_descriptions(prepared)
                 for mon in prepared:
-                    ref = output_ref(mon, set())
+                    ref = output_ref(mon, set(), ambiguous)
                     if ref and ref not in have:
                         needs_write = True
                         break
@@ -1548,7 +1638,7 @@ def recover_internal(quiet=False):
     return 0
 
 
-def output_ref(mon, used_desc):
+def output_ref(mon, used_desc, ambiguous=None):
     if is_dummy_monitor(mon):
         return ""
     name = clean_connector(mon.get("name"))
@@ -1558,7 +1648,10 @@ def output_ref(mon, used_desc):
     if name and INTERNAL_PANEL_RE.match(name):
         return name
     desc = clean_desc(mon.get("description") or "")
-    if desc and desc not in used_desc:
+    # Hyprland reads a desc: selector as a prefix, so a description two panels
+    # share would hand them both the same geometry. Only the connector names
+    # are unique for those, and the rule written first would win for both.
+    if desc and desc not in used_desc and not (ambiguous and desc in ambiguous):
         used_desc.add(desc)
         return "desc:%s" % desc
     if is_dummy_name(name):
@@ -1566,10 +1659,10 @@ def output_ref(mon, used_desc):
     return name
 
 
-def monitor_lua(mon, used_desc):
+def monitor_lua(mon, used_desc, ambiguous=None):
     if is_dummy_monitor(mon):
         return ""
-    name = output_ref(mon, used_desc)
+    name = output_ref(mon, used_desc, ambiguous)
     if not name or is_dummy_name(name):
         return ""
     # Named `disabled = true` for the laptop panel beats the catch-all fallback
@@ -1675,8 +1768,9 @@ def workspace_hosts(monitors, primary=""):
         hosts.append(mon)
 
     def sort_key(mon):
-        ident = mon.get("identity") or monitor_identity(mon)
-        lead = 0 if (primary and ident == primary) else 1
+        # The saved primary may still carry the description id of a panel that
+        # answers to its connector now, so accept either name for it.
+        lead = 0 if (primary and primary in identity_keys(mon)) else 1
         return (lead, int(mon.get("x") or 0), int(mon.get("y") or 0), mon.get("name") or "")
 
     hosts.sort(key=sort_key)
@@ -1731,7 +1825,9 @@ def plan_for_write(monitors):
     for host in workspace_hosts(monitors, primary):
         ident = host.get("identity") or monitor_identity(host)
         name = clean_connector(host.get("name"))
-        item = by_id.get(ident) or by_name.get(name)
+        item = next((by_id[key] for key in identity_keys(host) if key in by_id), None)
+        if not item:
+            item = by_name.get(name)
         ids = []
         for ws in (item.get("ids") if item else []) or []:
             try:
@@ -1760,12 +1856,7 @@ def plan_for_write(monitors):
         name = clean_connector(mon.get("name"))
         if name:
             live_names.add(name)
-        if mon.get("identity"):
-            live_idents.add(mon.get("identity"))
-        else:
-            ident_live = monitor_identity(mon)
-            if ident_live:
-                live_idents.add(ident_live)
+        live_idents.update(identity_keys(mon))
     for item in saved or []:
         if not isinstance(item, dict):
             continue
@@ -1909,10 +2000,11 @@ def report_workspace_plan():
 def workspace_rule_lines(monitors, primary=""):
     plan = plan_for_write(monitors)
     used = set()
+    ambiguous = ambiguous_descriptions(monitors)
     refs = {}
     for mon in monitors or []:
         if mon.get("name") or mon.get("description"):
-            refs[mon.get("name") or ""] = output_ref(mon, used)
+            refs[mon.get("name") or ""] = output_ref(mon, used, ambiguous)
     lines = []
     for item in plan:
         output = refs.get(item.get("name") or "")
@@ -1932,12 +2024,13 @@ def workspace_rule_lines(monitors, primary=""):
 
 def managed_block_lines(monitors):
     used = set()
+    ambiguous = ambiguous_descriptions(monitors)
     inner = [MANAGED_BEGIN]
     for mon in monitors:
         if is_dummy_monitor(mon):
             continue
         if mon.get("name") or mon.get("description"):
-            line = monitor_lua(mon, used)
+            line = monitor_lua(mon, used, ambiguous)
             if line:
                 inner.append(line)
     inner.append('hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })')
@@ -2991,10 +3084,13 @@ def prepare_monitors_for_write(monitors, restore_geometry=False):
     """Drop placeholders. If a real screen vanished, keep its saved rule."""
     live = [dict(m) for m in drop_dummy_monitors(monitors)]
     saved = saved_desk_entries()
-    live_ids = {monitor_identity(m) for m in live if monitor_identity(m)}
+    current_ids = {monitor_identity(m) for m in live if monitor_identity(m)}
+    # Every id a live output answers to, so a desk row saved under the older
+    # description id is not appended back as a rule for an absent screen.
+    live_ids = {key for m in live for key in identity_keys(m)}
     saved_ids = {entry["id"] for entry in saved}
     missing = [entry for entry in saved if entry["id"] not in live_ids]
-    if not live_ids or not missing or not (live_ids < saved_ids):
+    if not current_ids or not missing or not (current_ids < saved_ids):
         return live
     if restore_geometry:
         restore_desk_geometry(live)
@@ -4061,9 +4157,11 @@ def apply(payload, gdk=None, preview=False):
     return 0
 
 
-def was_disabled(store, identity):
+def was_disabled(store, mon):
+    """True when the store remembers this output as switched off."""
+    keys = identity_keys(mon) if isinstance(mon, dict) else [str(mon or "")]
     for entry in store.get("lastLayout") or []:
-        if entry.get("id") == identity:
+        if entry.get("id") in keys:
             return not entry.get("enabled", True)
     return False
 
@@ -4077,8 +4175,7 @@ def wake_new_outputs(monitors, prev_store):
     for mon in monitors:
         if not mon.get("enabled", True):
             continue
-        ident = monitor_identity(mon)
-        if ident and was_disabled(prev_store, ident):
+        if monitor_identity(mon) and was_disabled(prev_store, mon):
             newly.append(mon)
     if not newly:
         return
@@ -4100,7 +4197,9 @@ def wake_new_outputs(monitors, prev_store):
 
 def profile_entry_from_monitor(mon):
     return {
-        "id": monitor_identity(mon),
+        # The resolved id follows the output: a connector name for a panel that
+        # shares its description, the description otherwise.
+        "id": mon.get("identity") or monitor_identity(mon),
         "mode": mon.get("mode") or "preferred",
         "x": int(mon.get("x") or 0),
         "y": int(mon.get("y") or 0),
@@ -4127,10 +4226,13 @@ def profile_entry_from_monitor(mon):
 
 
 def merge_profile(profile, live):
-    by_id = {monitor_identity(m): m for m in live}
+    by_id = {}
+    for m in live:
+        for key in identity_keys(m):
+            by_id.setdefault(key, m)
     merged = []
     for live_m in live:
-        rule = profile_rule(profile, live_m.get("identity") or monitor_identity(live_m))
+        rule = profile_rule_for(profile, live_m)
         if not rule:
             merged.append(live_m)
             continue
@@ -4969,7 +5071,13 @@ def enable_output(name):
     store = load_store()
     if store.get("autoSwitch", True):
         ids = [m.get("identity") for m in monitors if m.get("enabled", True) and m.get("identity")]
-        match = match_profile(store, ids)
+        stored_ids = [
+            key
+            for m in monitors
+            if m.get("enabled", True)
+            for key in identity_keys(m)
+        ]
+        match = match_profile(store, ids, stored_ids)
         if match:
             return apply_profile(match)
     return apply({"monitors": monitors})

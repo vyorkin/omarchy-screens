@@ -1781,5 +1781,143 @@ class PanelStateFile(unittest.TestCase):
         self.assertIsNone(store.get("pendingRevert"))
 
 
+class SharedDescriptions(unittest.TestCase):
+    """Two panels of one model report one description and no serial.
+
+    Hyprland reads a desc: selector as a prefix, so such a description names
+    both panels at once; the connector is the only unique name left.
+    """
+
+    PANEL = "Xiaomi Corporation Mi Monitor"
+
+    def setUp(self):
+        import tempfile
+        self.ctl = load_ctl()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ctl.BACKUP_DIR = self.tmp.name
+        self.ctl.PROFILES_PATH = os.path.join(self.tmp.name, "profiles.json")
+        self.ctl.WORKSPACES_JSON = os.path.join(self.tmp.name, "workspaces.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def panel(self, name, x=0, y=0, identity=None, **kw):
+        mon = {
+            "name": name,
+            "description": self.PANEL,
+            "identity": identity if identity is not None else name,
+            "enabled": True,
+            "mode": "3440x1440@144.00",
+            "x": x,
+            "y": y,
+            "scale": 1.25,
+            "transform": 0,
+            "vrr": 0,
+            "width": 3440,
+            "height": 1440,
+            "mirror": "",
+            "label": name,
+        }
+        mon.update(kw)
+        return mon
+
+    def test_shared_description_is_not_an_identity(self):
+        panels = [self.panel("DP-1"), self.panel("DP-2", y=1152)]
+        ambiguous = self.ctl.ambiguous_descriptions(panels)
+        self.assertEqual(ambiguous, {self.PANEL})
+        self.assertEqual(self.ctl.monitor_identity(panels[0], ambiguous), "DP-1")
+        self.assertEqual(self.ctl.monitor_identity(panels[1], ambiguous), "DP-2")
+
+    def test_one_panel_keeps_the_description_id(self):
+        lone = [self.panel("DP-1")]
+        self.assertEqual(self.ctl.ambiguous_descriptions(lone), set())
+        self.assertEqual(self.ctl.monitor_identity(lone[0], set()), "desc:" + self.PANEL)
+
+    def test_identity_keys_offer_the_older_description_id(self):
+        self.assertEqual(
+            self.ctl.identity_keys(self.panel("DP-2")),
+            ["DP-2", "desc:" + self.PANEL],
+        )
+
+    def test_saved_entry_is_found_by_connector_or_description(self):
+        entry = {"id": "desc:" + self.PANEL, "textPx": 14}
+        hints = {"desc:" + self.PANEL: entry}
+        self.assertIs(self.ctl.saved_entry_for(hints, self.panel("DP-1")), entry)
+
+    def test_rules_use_connectors_for_a_shared_description(self):
+        block = self.ctl.managed_block_lines(
+            [self.panel("DP-1"), self.panel("DP-2", y=1152)]
+        )
+        joined = "\n".join(block)
+        self.assertIn('output = "DP-1"', joined)
+        self.assertIn('output = "DP-2"', joined)
+        self.assertNotIn("desc:" + self.PANEL, joined)
+
+    def test_rule_order_does_not_hand_one_panel_the_other_geometry(self):
+        # The shared description is unusable in either order, so the same rule
+        # set has to come out whichever way the live list is sorted.
+        forward = self.ctl.managed_block_lines(
+            [self.panel("DP-1"), self.panel("DP-2", y=1152)]
+        )
+        backward = self.ctl.managed_block_lines(
+            [self.panel("DP-2", y=1152), self.panel("DP-1")]
+        )
+        outputs = [
+            line.split("output = ")[1].split(",")[0]
+            for line in forward + backward
+            if "output = " in line
+        ]
+        self.assertNotIn('"desc:' + self.PANEL + '"', outputs)
+
+    def test_absent_twin_keeps_its_saved_rule(self):
+        self.ctl.save_store({
+            "deskLayout": [
+                {"id": "desc:" + self.PANEL, "x": 0, "y": 0, "mirror": ""},
+                {"id": "DP-2", "x": 0, "y": 1152, "mirror": ""},
+            ]
+        })
+        prepared = self.ctl.prepare_monitors_for_write([self.panel("DP-1")])
+        self.assertEqual([m.get("name") for m in prepared], ["DP-1", "DP-2"])
+        joined = "\n".join(self.ctl.managed_block_lines(prepared))
+        self.assertIn('output = "DP-2"', joined)
+
+    def test_legacy_description_row_is_not_appended_for_a_live_panel(self):
+        self.ctl.save_store({
+            "deskLayout": [{"id": "desc:" + self.PANEL, "x": 0, "y": 0, "mirror": ""}]
+        })
+        prepared = self.ctl.prepare_monitors_for_write([self.panel("DP-1")])
+        self.assertEqual([m.get("name") for m in prepared], ["DP-1"])
+
+    def test_profile_matches_an_id_saved_before_the_patch(self):
+        self.ctl.save_store({
+            "profiles": [{"name": "Desk", "monitors": [{"id": "desc:" + self.PANEL}]}]
+        })
+        store = self.ctl.load_store()
+        aliases = ["DP-1", "DP-2", "desc:" + self.PANEL]
+        self.assertEqual(self.ctl.match_profile(store, ["DP-1", "DP-2"], aliases), "Desk")
+
+    def test_profile_rule_accepts_the_older_id(self):
+        profile = {"monitors": [{"id": "desc:" + self.PANEL, "scale": 1.25}]}
+        rule = self.ctl.profile_rule_for(profile, self.panel("DP-2"))
+        self.assertEqual(rule["scale"], 1.25)
+
+    def test_a_disabled_row_saved_under_the_description_is_seen(self):
+        self.ctl.save_store({
+            "lastLayout": [{"id": "desc:" + self.PANEL, "enabled": False}]
+        })
+        store = self.ctl.load_store()
+        self.assertTrue(self.ctl.was_disabled(store, self.panel("DP-1")))
+
+    def test_primary_follows_a_panel_that_gained_a_connector_id(self):
+        self.ctl.save_store({"primary": "desc:" + self.PANEL})
+        store = self.ctl.load_store()
+        panels = [self.panel("DP-2", identity="DP-2")]
+        ambiguous = self.ctl.ambiguous_descriptions(panels)
+        owner = next((m for m in panels if "desc:" + self.PANEL in self.ctl.identity_keys(m, ambiguous)), None)
+        self.assertIsNotNone(owner)
+        self.assertEqual(owner["identity"], "DP-2")
+        self.assertEqual(store["primary"], "desc:" + self.PANEL)
+
+
 if __name__ == "__main__":
     unittest.main()
